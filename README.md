@@ -13,7 +13,7 @@ Supports three replication modes at any scale (tested to 1500+ tables).
 
 | Mode | When to use | Watermark needed | SCD2 history |
 |---|---|---|---|
-| `gold_mirror` | Redshift is a curated gold layer. Full refresh on a schedule. | No | No |
+| `gold_mirror` | Redshift is a curated gold layer. Full truncate+reload on a schedule. Optional watermark for change-detection. | Optional | No |
 | `cdc` | Incremental sync via `updated_at` watermark. | Yes (`updated_at` on every table) | No |
 | `scd2` | Same as CDC + full version history in Snowflake DIM schema. | Yes | Yes |
 
@@ -27,7 +27,7 @@ Redshift Serverless (private)
     → AWS VPC Endpoint Service → Snowflake PrivateLink endpoint
     → OpenFlow Runtime (NiFi on SPCS)
         ListDatabaseTables       discovers all tables dynamically (scales to 1500+)
-        GenerateTableFetch       paginated queries; watermark in cdc/scd2, full scan in gold_mirror
+        GenerateTableFetch       paginated queries; watermark in cdc/scd2; optional watermark change-detection in gold_mirror
         ExecuteSQL               10 concurrent tasks
         ConvertRecord            Avro → JSON
         [ExecuteScript]          TRUNCATE target table before load (gold_mirror only)

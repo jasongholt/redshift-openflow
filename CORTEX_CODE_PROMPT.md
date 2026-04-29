@@ -12,7 +12,7 @@ Choose the option that matches your goal and environment.
 **Set `REPLICATION_MODE` in your `.env`** to control which mode the flow uses:
 - `scd2` — incremental CDC + SCD2 Dynamic Tables (full version history)
 - `cdc` — incremental CDC only (RAW tables, no history)
-- `gold_mirror` — full extract + truncate-reload on schedule (no watermark needed)
+- `gold_mirror` — full truncate+reload on schedule. Optional watermark: if `WATERMARK_COLUMN` is set, only reloads tables that have changed since the last run (change-detection gate). If blank, every table reloads every cycle.
 
 ---
 
@@ -84,8 +84,10 @@ Important lessons from the original build:
 ## Option C — Simple Replication (Redshift as Gold Layer)
 
 Use this when Redshift is already the curated gold layer and you just want a
-faithful mirror in Snowflake. No CDC complexity, no SCD2, no watermarks.
-Every table lands in Snowflake exactly as it looks in Redshift, refreshed on a schedule.
+faithful mirror in Snowflake. No CDC complexity, no SCD2.
+Every changed table is truncated and reloaded in full on a schedule.
+Optionally, set WATERMARK_COLUMN to detect which tables have changed before reloading
+(avoids full scans on stable tables), or leave it blank to reload everything every cycle.
 
 ```
 I want to replicate tables from Amazon Redshift Serverless into Snowflake as-is
