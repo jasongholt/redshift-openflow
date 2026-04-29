@@ -1,0 +1,63 @@
+<mxGraphModel adaptiveColors="auto">
+  <root>
+    <mxCell id="0"/>
+    <mxCell id="1" parent="0"/>
+    <mxCell id="aws_box" value="AWS us-west-2" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF2CC;strokeColor=#D6B656;verticalAlign=top;fontStyle=1;fontSize=14;spacingTop=5;container=1;collapsible=0;" vertex="1" parent="1">
+      <mxGeometry x="40" y="40" width="300" height="280" as="geometry"/>
+    </mxCell>
+    <mxCell id="rs" value="Redshift Serverless&#xa;openflow-demo-wg&#xa;(sales.customers)" style="shape=cylinder3;whiteSpace=wrap;html=1;boundedLbl=1;backgroundOutline=1;size=15;fillColor=#FF8000;fontColor=#ffffff;strokeColor=#FF6600;" vertex="1" parent="aws_box">
+      <mxGeometry x="90" y="50" width="120" height="80" as="geometry"/>
+    </mxCell>
+    <mxCell id="nlb" value="Internal NLB&#xa;TCP:5439" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#D5E8D4;strokeColor=#82B366;" vertex="1" parent="aws_box">
+      <mxGeometry x="90" y="170" width="120" height="50" as="geometry"/>
+    </mxCell>
+    <mxCell id="e_rs_nlb" edge="1" parent="aws_box" source="rs" target="nlb" style="edgeStyle=orthogonalEdgeStyle;rounded=0;">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+    <mxCell id="pl_box" value="AWS PrivateLink" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E1D5E7;strokeColor=#9673A6;fontStyle=1;fontSize=12;" vertex="1" parent="1">
+      <mxGeometry x="380" y="210" width="140" height="50" as="geometry"/>
+    </mxCell>
+    <mxCell id="e_nlb_pl" edge="1" parent="1" source="nlb" target="pl_box" style="edgeStyle=orthogonalEdgeStyle;rounded=0;">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+    <mxCell id="sf_box" value="Snowflake SPCS" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#DAE8FC;strokeColor=#6C8EBF;verticalAlign=top;fontStyle=1;fontSize=14;spacingTop=5;container=1;collapsible=0;" vertex="1" parent="1">
+      <mxGeometry x="560" y="40" width="300" height="380" as="geometry"/>
+    </mxCell>
+    <mxCell id="of_runtime" value="OpenFlow Runtime&#xa;(redshft)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#B0E3FF;strokeColor=#2994CC;fontStyle=1;container=1;collapsible=0;verticalAlign=top;" vertex="1" parent="sf_box">
+      <mxGeometry x="30" y="50" width="240" height="140" as="geometry"/>
+    </mxCell>
+    <mxCell id="qdt" value="QueryDatabaseTable&#xa;(watermark: updated_at)&#xa;60s poll" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#2994CC;" vertex="1" parent="of_runtime">
+      <mxGeometry x="20" y="35" width="200" height="40" as="geometry"/>
+    </mxCell>
+    <mxCell id="pss" value="PutSnowpipeStreaming" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#2994CC;" vertex="1" parent="of_runtime">
+      <mxGeometry x="20" y="90" width="200" height="35" as="geometry"/>
+    </mxCell>
+    <mxCell id="e_qdt_pss" edge="1" parent="of_runtime" source="qdt" target="pss" style="edgeStyle=orthogonalEdgeStyle;rounded=0;">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+    <mxCell id="landing" value="SALES.CUSTOMERS&#xa;(append-only landing)" style="shape=cylinder3;whiteSpace=wrap;html=1;boundedLbl=1;backgroundOutline=1;size=15;fillColor=#29B5E8;fontColor=#ffffff;strokeColor=#1A8CB5;" vertex="1" parent="sf_box">
+      <mxGeometry x="80" y="210" width="140" height="60" as="geometry"/>
+    </mxCell>
+    <mxCell id="e_pss_land" edge="1" parent="sf_box" source="pss" target="landing" style="edgeStyle=orthogonalEdgeStyle;rounded=0;">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+    <mxCell id="scd2" value="DIM.CUSTOMERS_SCD2&#xa;(Dynamic Table)" style="shape=cylinder3;whiteSpace=wrap;html=1;boundedLbl=1;backgroundOutline=1;size=15;fillColor=#0078D4;fontColor=#ffffff;strokeColor=#005A9E;" vertex="1" parent="sf_box">
+      <mxGeometry x="80" y="295" width="140" height="60" as="geometry"/>
+    </mxCell>
+    <mxCell id="e_land_scd2" edge="1" parent="sf_box" source="landing" target="scd2" style="edgeStyle=orthogonalEdgeStyle;rounded=0;" value="5 min refresh">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+    <mxCell id="e_pl_of" edge="1" parent="1" source="pl_box" target="of_runtime" style="edgeStyle=orthogonalEdgeStyle;rounded=0;">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+    <mxCell id="curr_box" value="DIM.CUSTOMERS_CURRENT&#xa;(Dynamic Table)" style="shape=cylinder3;whiteSpace=wrap;html=1;boundedLbl=1;backgroundOutline=1;size=15;fillColor=#0078D4;fontColor=#ffffff;strokeColor=#005A9E;" vertex="1" parent="1">
+      <mxGeometry x="920" y="335" width="160" height="60" as="geometry"/>
+    </mxCell>
+    <mxCell id="e_scd2_curr" edge="1" parent="1" source="scd2" target="curr_box" style="edgeStyle=orthogonalEdgeStyle;rounded=0;" value="5 min refresh">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+    <mxCell id="title" value="Redshift to Snowflake: Custom OpenFlow JDBC Connector with SCD Type 2" style="text;html=1;align=center;verticalAlign=middle;resizable=0;points=[];autosize=1;strokeColor=none;fillColor=none;fontSize=16;fontStyle=1;" vertex="1" parent="1">
+      <mxGeometry x="200" y="450" width="560" height="30" as="geometry"/>
+    </mxCell>
+  </root>
+</mxGraphModel>
