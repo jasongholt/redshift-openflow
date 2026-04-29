@@ -1,7 +1,13 @@
 # Cortex Code Starter Prompt — Redshift-to-Snowflake OpenFlow CDC SCD2
 
 Paste this prompt into a Cortex Code session to begin or reproduce this project.
-Choose **Option A** (AWS needs setup) or **Option B** (AWS already exists) based on your environment.
+Choose the option that matches your goal and environment.
+
+| Option | When to use |
+|--------|------------|
+| **A — Full Setup** | AWS does not exist yet, want full CDC + SCD2 pipeline |
+| **B — Snowflake + Connector only** | AWS/Redshift already running, want full CDC + SCD2 pipeline |
+| **C — Simple Replication** | Just replicate Redshift gold layer as-is to Snowflake, no CDC/SCD2 complexity |
 
 ---
 
@@ -64,6 +70,82 @@ Important lessons from the original build:
 - UpdateRecord literal-value strategy cannot reference other fields — use QueryRecord SQL for cross-field transforms
 - Redshift passwords with special characters (!, @) cause JDBC auth failures — use alphanumeric only
 - NiFi ProcessorsApi.clear_state is version-suffixed as clear_state3() in nipyapi
+```
+
+---
+
+## Option C — Simple Replication (Redshift as Gold Layer)
+
+Use this when Redshift is already the curated gold layer and you just want a
+faithful mirror in Snowflake. No CDC complexity, no SCD2, no watermarks.
+Every table lands in Snowflake exactly as it looks in Redshift, refreshed on a schedule.
+
+```
+I want to replicate tables from Amazon Redshift Serverless into Snowflake as-is
+using Snowflake OpenFlow (hosted NiFi on SPCS). Redshift is our gold layer — tables
+are already clean and curated. I do not need CDC or SCD2. I just want a reliable,
+scheduled mirror of those tables in Snowflake so downstream tools can query them.
+
+Requirements:
+- All tables in the Redshift `sales` schema should be replicated to Snowflake
+- Full refresh per table on a schedule (e.g., every 15 minutes)
+- No watermarking or incremental logic — truncate and reload is acceptable for small tables,
+  or use a simple full extract if tables are larger
+- No transformation — land data exactly as it comes from Redshift
+- Data should be queryable in Snowflake as REDSHIFT_DEMO.RAW.<table_name>
+
+AWS infrastructure is already in place:
+  - Redshift Serverless workgroup is running
+  - NLB forwards port 5439 to Redshift ENIs
+  - VPC Endpoint Service exists for PrivateLink
+
+The project repo is cloned at redshift-openflow-scd2/.
+
+Relevant files:
+  .env.example                       — all config variables with instructions
+  setup/02_snowflake_networking.sql  — Network Rule + EAI (run as ACCOUNTADMIN)
+  setup/03_snowflake_objects.sql     — database, schemas, target tables
+  connector/build_flow.py            — NiFi flow builder (can be simplified for this use case)
+  drivers/redshift-jdbc42-2.2.5.zip  — Redshift JDBC driver
+
+NiFi flow for simple replication (no watermark, no SCD2):
+  ListDatabaseTables     discovers all tables in the source schema automatically
+  GenerateTableFetch     generates full SELECT queries (Partition Size = 0, no Maximum-value Columns)
+  ExecuteSQL             executes queries with 10 concurrent tasks
+  ConvertRecord          converts Avro output to JSON
+  UpdateRecord           adds source_system and ingested_at metadata fields
+  PutSnowpipeStreaming    writes to Snowflake with Table=${db.table.name} (dynamic routing)
+
+Please start by:
+1. Copying .env.example to .env and helping me fill in my values
+2. Running setup/02_snowflake_networking.sql (update NLB_DNS at the top first)
+3. Creating the OpenFlow runtime via Control Plane UI (manual — cannot be scripted):
+   - Size: Medium for dev, Large for production
+   - Attach the EAI created in step 2
+4. Running setup/03_snowflake_objects.sql to create the target tables
+5. Extracting the JDBC driver: mkdir -p /tmp/redshift-jdbc && cd /tmp/redshift-jdbc && unzip drivers/redshift-jdbc42-2.2.5.zip
+6. Running connector/build_flow.py — but simplify the GenerateTableFetch config:
+   - Remove Maximum-value Columns (no watermark)
+   - Set Partition Size to 0 (single query per table, full extract)
+   - Set ListDatabaseTables schedule to your desired refresh interval (e.g., 15 min)
+7. Optionally add a TRUNCATE before each load if you want clean full refreshes
+   (use an ExecuteScript or RouteOnAttribute + ExecuteSQL processor before PutSnowpipeStreaming)
+
+Use the $openflow skill for NiFi/nipyapi patterns and processor configuration.
+
+Key difference from CDC/SCD2 mode:
+- No watermark column required — tables do not need an updated_at column
+- No Snowflake Dynamic Tables needed — RAW tables are the final destination
+- Simpler setup: skip setup/03_snowflake_objects.sql steps 5 and 6 (SCD2 Dynamic Tables)
+- Trade-off: full table scans on every run — suitable for gold layer tables that are
+  already small/curated, not for high-volume raw tables
+
+Important lessons that still apply:
+- GTF Table Name MUST be schema-qualified: ${db.table.schema}.${db.table.name}
+  (ListDatabaseTables emits table name without schema prefix — this will silently produce 0 rows if wrong)
+- nipyapi create_parameter_context() returns HTTP 500 on some runtimes — use raw NiFi REST API instead
+- PutSnowpipeStreaming target tables must exist in Snowflake before data flows
+- Redshift passwords with special characters (!, @) cause JDBC auth failures — use alphanumeric only
 ```
 
 ---
