@@ -3,23 +3,30 @@
 Redshift-to-Snowflake OpenFlow Custom JDBC Connector
 =====================================================
 
-Builds a complete NiFi flow on an OpenFlow runtime that:
-1. Discovers all tables in a Redshift schema via ListDatabaseTables
-2. Generates paginated watermark queries via GenerateTableFetch
-3. Executes queries in parallel via ExecuteSQL (10 concurrent tasks)
-4. Converts Avro to JSON via ConvertRecord
-5. Adds metadata (source_system, source_table, ingested_at) via UpdateRecord
-6. Writes to Snowflake dynamically via PutSnowpipeStreaming (Table=${db.table.name})
+Builds a NiFi flow that replicates Redshift tables to Snowflake.
+Supports three modes controlled by REPLICATION_MODE in .env:
+
+  gold_mirror  Full extract on schedule. Truncates target before each load.
+               No watermark column required.
+
+  cdc          Incremental extract via updated_at watermark.
+               Appends only new/changed rows. Requires updated_at on all tables.
+
+  scd2         Same as cdc. SCD Type 2 Dynamic Tables are handled separately
+               by setup/06_create_scd2_tables.py — the NiFi flow is identical to cdc.
+
+Flow: ListDatabaseTables → GenerateTableFetch → ExecuteSQL → ConvertRecord
+      → [ExecuteScript (gold_mirror truncate)] → UpdateRecord → PutSnowpipeStreaming
 
 Prerequisites:
   - OpenFlow runtime created with EAI attached (manual via Control Plane UI)
-  - nipyapi installed and profile configured for the runtime
-  - Redshift JDBC driver ZIP extracted to JDBC_JAR_DIR
-  - Snowflake target tables pre-created (see setup/03_snowflake_objects.sql)
+  - JDBC driver extracted: unzip drivers/redshift-jdbc42-*.zip -d $JDBC_JAR_DIR
+  - Target tables pre-created: python setup/05_create_target_tables.py
+  - For scd2: python setup/06_create_scd2_tables.py after first data load
 
 Usage:
-  export NIPYAPI_PROFILE=jholt_admin_redshift  # or your profile name
-  python build_flow.py
+  cp .env.example .env   # fill in your values
+  python connector/build_flow.py
 """
 import json
 import glob
@@ -29,6 +36,7 @@ import time
 import urllib.request
 from pathlib import Path
 
+# Load .env from repo root
 env_file = Path(__file__).resolve().parent.parent / ".env"
 if env_file.exists():
     for line in env_file.read_text().splitlines():
@@ -38,33 +46,53 @@ if env_file.exists():
             os.environ.setdefault(key.strip(), value.strip())
 
 # =============================================================================
-# CONFIGURATION — Edit these values for your environment
+# CONFIGURATION — all values come from .env
 # =============================================================================
 
-NIFI_BASE_URL = os.getenv("NIFI_BASE_URL",
-    f"https://{os.getenv('OPENFLOW_HOST', 'of--sfsenorthamerica-demojholtawsw.snowflakecomputing.app')}/{os.getenv('OPENFLOW_RUNTIME', 'redshft')}/nifi-api")
+MODE = os.getenv("REPLICATION_MODE", "scd2")  # gold_mirror | cdc | scd2
+if MODE not in ("gold_mirror", "cdc", "scd2"):
+    print(f"ERROR: REPLICATION_MODE must be gold_mirror, cdc, or scd2. Got: {MODE}")
+    exit(1)
 
+print(f"\n  Mode: {MODE.upper()}")
+
+OPENFLOW_HOST = os.getenv("OPENFLOW_HOST", "")
+OPENFLOW_RUNTIME = os.getenv("OPENFLOW_RUNTIME", "")
+NIFI_BASE_URL = f"https://{OPENFLOW_HOST}/{OPENFLOW_RUNTIME}/nifi-api"
 NIFI_PAT = os.getenv("NIFI_PAT", "")
 
 JDBC_JAR_DIR = os.getenv("JDBC_JAR_DIR", "/tmp/redshift-jdbc")
 
-REDSHIFT_URL = os.getenv("REDSHIFT_URL",
-    f"jdbc:redshift://{os.getenv('NLB_DNS', 'localhost')}:{os.getenv('NLB_PORT', '5439')}/{os.getenv('REDSHIFT_DB', 'demo')}")
+NLB_DNS = os.getenv("NLB_DNS", "localhost")
+NLB_PORT = os.getenv("NLB_PORT", "5439")
+REDSHIFT_DB = os.getenv("REDSHIFT_DB", "demo")
+REDSHIFT_URL = f"jdbc:redshift://{NLB_DNS}:{NLB_PORT}/{REDSHIFT_DB}"
 REDSHIFT_USER = os.getenv("REDSHIFT_ADMIN_USER", "admin")
 REDSHIFT_PASSWORD = os.getenv("REDSHIFT_ADMIN_PASSWORD", "")
 
 SF_DATABASE = os.getenv("SF_DATABASE", "REDSHIFT_DEMO")
-SF_SCHEMA = os.getenv("SF_SCHEMA_RAW", os.getenv("SF_SCHEMA", "RAW"))
-SF_WAREHOUSE = os.getenv("SF_WAREHOUSE", "DEMO_JGH")
+SF_SCHEMA = os.getenv("SF_SCHEMA_RAW", "RAW")
+SF_WAREHOUSE = os.getenv("SF_WAREHOUSE", "")
 SF_ROLE = os.getenv("SF_RUNTIME_ROLE", "OPENFLOW_RUNTIME_ROLE_MYSQL")
 
 REDSHIFT_SCHEMA_PATTERN = os.getenv("REDSHIFT_SCHEMA_PATTERN", os.getenv("REDSHIFT_SCHEMA", "sales"))
 REDSHIFT_TABLE_PATTERN = os.getenv("REDSHIFT_TABLE_PATTERN", "%")
-WATERMARK_COLUMN = os.getenv("WATERMARK_COLUMN", "updated_at")
+
+# Mode-specific GTF settings
+if MODE == "gold_mirror":
+    WATERMARK_COLUMN = ""           # No watermark — full extract every run
+    GTF_PARTITION_SIZE = os.getenv("GTF_PARTITION_SIZE", "0")  # 0 = single query per table
+    TRUNCATE_BEFORE_LOAD = os.getenv("TRUNCATE_BEFORE_LOAD", "true").lower() == "true"
+else:  # cdc or scd2
+    WATERMARK_COLUMN = os.getenv("WATERMARK_COLUMN", "updated_at")
+    GTF_PARTITION_SIZE = os.getenv("GTF_PARTITION_SIZE", "10000")
+    TRUNCATE_BEFORE_LOAD = False
 
 DBCP_MAX_CONNECTIONS = int(os.getenv("DBCP_MAX_CONNECTIONS", "25"))
 ESQL_CONCURRENT_TASKS = int(os.getenv("ESQL_CONCURRENT_TASKS", "10"))
 PSS_CONCURRENT_TASKS = int(os.getenv("PSS_CONCURRENT_TASKS", "5"))
+NIFI_QUEUE_OBJECT_THRESHOLD = os.getenv("NIFI_QUEUE_OBJECT_THRESHOLD", "50000")
+NIFI_QUEUE_SIZE_THRESHOLD = os.getenv("NIFI_QUEUE_SIZE_THRESHOLD", "2 GB")
 
 # =============================================================================
 # NiFi REST API helpers
@@ -131,14 +159,18 @@ def configure_processor(proc_id, properties=None, scheduling=None, auto_terminat
         "component": {"id": proc_id, "config": config}
     })
 
-def create_connection(source_id, dest_id, rels, pg_id):
+def create_connection(source_id, dest_id, rels, pg_id, backpressure=False):
     body = {"revision": {"version": 0}, "component": {
         "source": {"id": source_id, "groupId": pg_id, "type": "PROCESSOR"},
         "destination": {"id": dest_id, "groupId": pg_id, "type": "PROCESSOR"},
         "selectedRelationships": rels,
     }}
-    api("POST", f"/process-groups/{pg_id}/connections", body)
+    if backpressure:
+        body["component"]["backPressureObjectThreshold"] = int(NIFI_QUEUE_OBJECT_THRESHOLD)
+        body["component"]["backPressureDataSizeThreshold"] = NIFI_QUEUE_SIZE_THRESHOLD
+    result = api("POST", f"/process-groups/{pg_id}/connections", body)
     print(f"  Connected [{', '.join(rels)}]")
+    return result
 
 def enable_controller(cs_id):
     current = api("GET", f"/controller-services/{cs_id}")
@@ -151,20 +183,41 @@ def section(title):
 
 
 # =============================================================================
+# VALIDATION
+# =============================================================================
+
+errors = []
+if not NIFI_PAT:
+    errors.append("NIFI_PAT is not set — get from nipyapi profile or OpenFlow session")
+if not OPENFLOW_HOST:
+    errors.append("OPENFLOW_HOST is not set")
+if not OPENFLOW_RUNTIME:
+    errors.append("OPENFLOW_RUNTIME is not set")
+if not REDSHIFT_PASSWORD:
+    errors.append("REDSHIFT_ADMIN_PASSWORD is not set")
+if not SF_WAREHOUSE:
+    errors.append("SF_WAREHOUSE is not set")
+if MODE in ("cdc", "scd2") and not WATERMARK_COLUMN:
+    errors.append(f"WATERMARK_COLUMN must be set for mode '{MODE}'")
+
+if errors:
+    print("\nERROR: Missing required configuration:")
+    for e in errors:
+        print(f"  - {e}")
+    print("\nFix these in your .env file and retry.")
+    exit(1)
+
+
+# =============================================================================
 # MAIN FLOW BUILD
 # =============================================================================
 
-if not NIFI_PAT:
-    print("ERROR: Set NIFI_PAT environment variable with your NiFi bearer token")
-    print("  Get it from: nipyapi profiles or OpenFlow session token")
-    exit(1)
-
-section("Step 1: Create Parameter Context + Upload JDBC Driver")
+section(f"Step 1: Create Parameter Context + Upload JDBC Driver  [mode={MODE}]")
 
 ctx_body = {
     "revision": {"version": 0},
     "component": {
-        "name": "Redshift Parameters",
+        "name": f"Redshift Parameters ({MODE})",
         "parameters": [
             {"parameter": {"name": "redshift_url", "value": REDSHIFT_URL, "sensitive": False}},
             {"parameter": {"name": "redshift_user", "value": REDSHIFT_USER, "sensitive": False}},
@@ -195,7 +248,7 @@ print(f"  {len(all_assets)} JAR assets uploaded")
 current = api("GET", f"/parameter-contexts/{CTX_ID}")
 params = current["component"]["parameters"]
 params.append({"parameter": {"name": "redshift_driver", "sensitive": False, "value": None, "referencedAssets": all_assets}})
-api("PUT", f"/parameter-contexts/{CTX_ID}", {"revision": current["revision"], "id": CTX_ID, "component": {"id": CTX_ID, "name": "Redshift Parameters", "parameters": params}})
+api("PUT", f"/parameter-contexts/{CTX_ID}", {"revision": current["revision"], "id": CTX_ID, "component": {"id": CTX_ID, "name": f"Redshift Parameters ({MODE})", "parameters": params}})
 print("  JDBC driver linked to redshift_driver parameter")
 
 
@@ -204,7 +257,7 @@ section("Step 2: Create Process Group")
 root_id = api("GET", "/process-groups/root")["id"]
 pg = api("POST", f"/process-groups/{root_id}/process-groups", {
     "revision": {"version": 0},
-    "component": {"name": "Redshift to Snowflake CDC", "position": {"x": 500, "y": 500}},
+    "component": {"name": f"Redshift to Snowflake [{MODE.upper()}]", "position": {"x": 500, "y": 500}},
 })
 PG_ID = pg["id"]
 print(f"  Process Group: {PG_ID}")
@@ -240,10 +293,27 @@ avro_reader = create_controller(PG_ID, "org.apache.nifi.avro.AvroReader", "Avro 
 json_reader = create_controller(PG_ID, "org.apache.nifi.json.JsonTreeReader", "JSON Reader")
 json_writer = create_controller(PG_ID, "org.apache.nifi.json.JsonRecordSetWriter", "JSON Writer")
 
+sf_conn = None
+if MODE == "gold_mirror" and TRUNCATE_BEFORE_LOAD:
+    sf_conn = create_controller(PG_ID, "com.snowflake.openflow.runtime.services.snowflake.SnowflakeConnectionService", "Snowflake Connection")
+    sf_conn_rev = api("GET", f"/controller-services/{sf_conn['id']}")["revision"]
+    api("PUT", f"/controller-services/{sf_conn['id']}", {
+        "revision": sf_conn_rev, "id": sf_conn["id"],
+        "component": {"id": sf_conn["id"], "properties": {
+            "snowflake-database": "#{sf_database}",
+            "snowflake-schema": "#{sf_schema}",
+            "snowflake-warehouse": "#{sf_warehouse}",
+            "snowflake-role": "#{sf_role}",
+            "Auth Strategy": "SNOWFLAKE_SESSION_TOKEN",
+        }},
+    })
+    print("  Snowflake Connection Service configured (for pre-load TRUNCATE)")
+
 
 section("Step 4: Create Processors")
 
-ldt = create_processor(PG_ID, "ListDatabaseTables", "Discover Tables", 400, 100)
+y = 100
+ldt = create_processor(PG_ID, "ListDatabaseTables", "Discover Tables", 400, y)
 configure_processor(ldt["id"], properties={
     "Database Connection Pooling Service": dbcp["id"],
     "Schema Pattern": REDSHIFT_SCHEMA_PATTERN,
@@ -253,26 +323,50 @@ configure_processor(ldt["id"], properties={
     "Refresh Interval": "5 mins",
 }, scheduling={"schedulingPeriod": "5 min", "schedulingStrategy": "TIMER_DRIVEN"})
 
-gtf = create_processor(PG_ID, "GenerateTableFetch", "Generate Queries", 400, 300)
-configure_processor(gtf["id"], properties={
+y += 200
+gtf_props = {
     "Database Connection Pooling Service": dbcp["id"],
     "Table Name": "${db.table.schema}.${db.table.name}",
-    "Partition Size": "10000",
-    "Maximum-value Columns": WATERMARK_COLUMN,
-}, auto_terminate=["failure"])
+    "Partition Size": GTF_PARTITION_SIZE,
+}
+if WATERMARK_COLUMN:
+    gtf_props["Maximum-value Columns"] = WATERMARK_COLUMN
+    print(f"  GTF: watermark={WATERMARK_COLUMN}, partition={GTF_PARTITION_SIZE}")
+else:
+    print(f"  GTF: no watermark (full extract), partition={GTF_PARTITION_SIZE}")
 
-esql = create_processor(PG_ID, "org.apache.nifi.processors.standard.ExecuteSQL", "Execute Queries", 400, 500)
+gtf = create_processor(PG_ID, "GenerateTableFetch", "Generate Queries", 400, y)
+configure_processor(gtf["id"], properties=gtf_props, auto_terminate=["failure"])
+
+y += 200
+esql = create_processor(PG_ID, "org.apache.nifi.processors.standard.ExecuteSQL", "Execute Queries", 400, y)
 configure_processor(esql["id"], properties={
     "Database Connection Pooling Service": dbcp["id"],
 }, scheduling={"concurrentlySchedulableTaskCount": ESQL_CONCURRENT_TASKS}, auto_terminate=["failure"])
 
-convert = create_processor(PG_ID, "ConvertRecord", "Avro to JSON", 400, 700)
+y += 200
+convert = create_processor(PG_ID, "ConvertRecord", "Avro to JSON", 400, y)
 configure_processor(convert["id"], properties={
     "Record Reader": avro_reader["id"],
     "Record Writer": json_writer["id"],
 }, scheduling={"concurrentlySchedulableTaskCount": 5}, auto_terminate=["failure"])
 
-update = create_processor(PG_ID, "UpdateRecord", "Add Metadata", 400, 900)
+# gold_mirror: insert TRUNCATE step between ConvertRecord and UpdateRecord
+truncate_proc = None
+if MODE == "gold_mirror" and TRUNCATE_BEFORE_LOAD and sf_conn:
+    y += 200
+    truncate_proc = create_processor(PG_ID, "ExecuteSQL", "Truncate Target Table", 400, y)
+    # Uses Snowflake connection to truncate before load
+    # The SQL runs: TRUNCATE TABLE IF EXISTS <schema>.<table>
+    configure_processor(truncate_proc["id"], properties={
+        "Database Connection Pooling Service": sf_conn["id"],
+        "SQL select query": f"TRUNCATE TABLE IF EXISTS {SF_DATABASE}.{SF_SCHEMA}.${{db.table.name}}",
+        "Content Output Strategy": "EMPTY",
+    }, scheduling={"concurrentlySchedulableTaskCount": 3}, auto_terminate=["failure"])
+    print(f"  TRUNCATE processor added (gold_mirror mode)")
+
+y += 200
+update = create_processor(PG_ID, "UpdateRecord", "Add Metadata", 400, y)
 configure_processor(update["id"], properties={
     "Record Reader": json_reader["id"],
     "Record Writer": json_writer["id"],
@@ -280,10 +374,12 @@ configure_processor(update["id"], properties={
     "/source_system": "REDSHIFT",
     "/source_table": "${db.table.name}",
     "/source_schema": "${db.table.schema}",
-    '/ingested_at': '${now():format("yyyy-MM-dd HH:mm:ss")}',
+    "/replication_mode": MODE,
+    "/ingested_at": '${now():format("yyyy-MM-dd HH:mm:ss")}',
 }, scheduling={"concurrentlySchedulableTaskCount": 5}, auto_terminate=["failure"])
 
-pss = create_processor(PG_ID, "PutSnowpipeStreaming", "Write to Snowflake", 400, 1100)
+y += 200
+pss = create_processor(PG_ID, "PutSnowpipeStreaming", "Write to Snowflake", 400, y)
 configure_processor(pss["id"], properties={
     "Authentication Strategy": "SNOWFLAKE_SESSION_TOKEN",
     "Table": "${db.table.name}",
@@ -298,15 +394,25 @@ configure_processor(pss["id"], properties={
 
 section("Step 5: Enable Controllers + Wire Connections")
 
-for cs in [dbcp, avro_reader, json_reader, json_writer]:
+controllers_to_enable = [dbcp, avro_reader, json_reader, json_writer]
+if sf_conn:
+    controllers_to_enable.append(sf_conn)
+for cs in controllers_to_enable:
     enable_controller(cs["id"])
     time.sleep(1)
 print("  All controllers enabled")
 
-create_connection(ldt["id"], gtf["id"], ["success"], PG_ID)
-create_connection(gtf["id"], esql["id"], ["success"], PG_ID)
+# Wire pipeline — LDT→GTF uses back-pressure to handle 1500-table queue bursts
+create_connection(ldt["id"], gtf["id"], ["success"], PG_ID, backpressure=True)
+create_connection(gtf["id"], esql["id"], ["success"], PG_ID, backpressure=True)
 create_connection(esql["id"], convert["id"], ["success"], PG_ID)
-create_connection(convert["id"], update["id"], ["success"], PG_ID)
+
+if truncate_proc:
+    create_connection(convert["id"], truncate_proc["id"], ["success"], PG_ID)
+    create_connection(truncate_proc["id"], update["id"], ["success"], PG_ID)
+else:
+    create_connection(convert["id"], update["id"], ["success"], PG_ID)
+
 create_connection(update["id"], pss["id"], ["success"], PG_ID)
 print("  Full pipeline wired")
 
@@ -318,19 +424,30 @@ print("  Flow started!")
 
 
 section("SUMMARY")
+watermark_info = f"watermark={WATERMARK_COLUMN}" if WATERMARK_COLUMN else "no watermark (full extract)"
+truncate_info = "TRUNCATE before load" if TRUNCATE_BEFORE_LOAD and truncate_proc else "append-only"
 print(f"""
+  Mode: {MODE.upper()}
   Process Group:        {PG_ID}
   Parameter Context:    {CTX_ID}
   DBCP Pool:            {dbcp['id']} (max {DBCP_MAX_CONNECTIONS} connections)
-  
+
   Pipeline:
     ListDatabaseTables  {ldt['id']}  schema={REDSHIFT_SCHEMA_PATTERN}, pattern={REDSHIFT_TABLE_PATTERN}
-    GenerateTableFetch  {gtf['id']}  watermark={WATERMARK_COLUMN}, partition=10000
+    GenerateTableFetch  {gtf['id']}  {watermark_info}, partition={GTF_PARTITION_SIZE}
     ExecuteSQL          {esql['id']}  {ESQL_CONCURRENT_TASKS} concurrent tasks
     ConvertRecord       {convert['id']}  Avro -> JSON
-    UpdateRecord        {update['id']}  +source_system, +source_table, +ingested_at
+""" + (f"    Truncate Target     {truncate_proc['id']}  {truncate_info}\n" if truncate_proc else "") + f"""    UpdateRecord        {update['id']}  +source_system, +source_table, +replication_mode, +ingested_at
     PutSnowpipeStreaming {pss['id']}  Table=${{db.table.name}}, {PSS_CONCURRENT_TASKS} tasks
+
+  Back-pressure (LDT->GTF, GTF->ExecuteSQL):
+    Object threshold:   {NIFI_QUEUE_OBJECT_THRESHOLD}
+    Size threshold:     {NIFI_QUEUE_SIZE_THRESHOLD}
 
   IMPORTANT: GTF Table Name uses ${{db.table.schema}}.${{db.table.name}}
   (LDT emits table name without schema prefix)
+
+  Next steps:
+    - Run setup/05_create_target_tables.py if not already done
+""" + (f"    - Run setup/06_create_scd2_tables.py after first data load\n" if MODE == "scd2" else "") + """    - Monitor: python tests/parity_test.py
 """)

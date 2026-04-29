@@ -1,175 +1,182 @@
-# Redshift to Snowflake: Custom OpenFlow JDBC Connector with SCD Type 2
+# Redshift to Snowflake: OpenFlow Multi-Mode Replication
 
-Replicate tables from Amazon Redshift Serverless into Snowflake via OpenFlow (hosted Apache NiFi on SPCS), with watermark-based incremental sync, in-flight metadata enrichment, and SCD Type 2 history tracking via Dynamic Tables.
+Replicate Amazon Redshift Serverless tables into Snowflake via OpenFlow (hosted NiFi on SPCS).
+Supports three replication modes at any scale (tested to 1500+ tables).
+
+## Replication Modes
+
+| Mode | When to use | Watermark needed | SCD2 history |
+|---|---|---|---|
+| `gold_mirror` | Redshift is a curated gold layer. Full refresh on a schedule. | No | No |
+| `cdc` | Incremental sync via `updated_at` watermark. | Yes (`updated_at` on every table) | No |
+| `scd2` | Same as CDC + full version history in Snowflake DIM schema. | Yes | Yes |
+
+Set `REPLICATION_MODE` in your `.env` before running any setup script.
 
 ## Architecture
 
 ```
-Redshift Serverless
-    |
-    | (port 5439)
-    v
-Network Load Balancer (internal)
-    |
-    | AWS PrivateLink
-    v
-Snowflake VPC Endpoint
-    |
-    v
-OpenFlow Runtime (NiFi on SPCS)
-    |
-    | ListDatabaseTables    -- discovers all tables in schema
-    | GenerateTableFetch    -- generates paginated watermark queries
-    | ExecuteSQL            -- executes queries (10 concurrent tasks)
-    | ConvertRecord         -- Avro -> JSON
-    | UpdateRecord          -- adds source_system, source_table, ingested_at
-    | PutSnowpipeStreaming  -- writes to Snowflake (dynamic table routing)
-    |
-    v
-REDSHIFT_DEMO.RAW.*         -- landing tables (one per source table)
-    |
-    v (Dynamic Table, 5-min lag)
-REDSHIFT_DEMO.DIM.CUSTOMERS_SCD2    -- SCD Type 2 (full history)
-    |
-    v (Dynamic Table, 5-min lag)
-REDSHIFT_DEMO.DIM.CUSTOMERS_CURRENT -- latest version per customer
+Redshift Serverless (private)
+    → Network Load Balancer (internal, port 5439)
+    → AWS VPC Endpoint Service → Snowflake PrivateLink endpoint
+    → OpenFlow Runtime (NiFi on SPCS)
+        ListDatabaseTables       discovers all tables dynamically (scales to 1500+)
+        GenerateTableFetch       paginated queries; watermark in cdc/scd2, full scan in gold_mirror
+        ExecuteSQL               10 concurrent tasks
+        ConvertRecord            Avro → JSON
+        [ExecuteScript]          TRUNCATE target table before load (gold_mirror only)
+        UpdateRecord             adds source_system, source_table, replication_mode, ingested_at
+        PutSnowpipeStreaming      writes to Table=${db.table.name} (dynamic routing)
+    → REDSHIFT_DEMO.RAW.*                    one landing table per source table
+    → REDSHIFT_DEMO.DIM.*_SCD2              SCD2 version history (scd2 mode only)
+    → REDSHIFT_DEMO.DIM.*_CURRENT           latest-state view (scd2 mode only)
 ```
 
 ## Prerequisites
 
-- AWS account with permissions for Redshift Serverless, EC2 (NLB, VPC endpoints), IAM
-- Snowflake account with ACCOUNTADMIN and an OpenFlow deployment
-- Python 3.10+ with `nipyapi` installed (for tests: also `snowflake-connector-python`)
+- AWS account with Redshift Serverless, EC2, VPC permissions
+- Snowflake account with ACCOUNTADMIN and an active OpenFlow deployment
+- Python 3.10+ with `snowflake-connector-python` and `nipyapi` (for SCD2 tests)
 - AWS CLI configured
 
 ## Setup Steps
 
-### Step 1: AWS Infrastructure
+### Step 1: Configure environment
 
-Creates Redshift Serverless, NLB, and VPC Endpoint Service for PrivateLink.
+```bash
+cp .env.example .env
+# Edit .env — set REPLICATION_MODE and all REQUIRED values
+```
+
+### Step 2: AWS Infrastructure (skip if Redshift already exists)
 
 ```bash
 chmod +x setup/01_aws_redshift.sh
 ./setup/01_aws_redshift.sh
+# Copy NLB_DNS from output into .env
 ```
 
-Save the output values: `NLB_DNS` and `VPC_ENDPOINT_SERVICE_NAME`.
+### Step 3: Snowflake Networking (MANUAL + SQL)
 
-### Step 2: Snowflake Networking (MANUAL + SQL)
+1. **Create PrivateLink endpoint** — Snowsight > Admin > Accounts > PrivateLink > New
+2. Edit `setup/02_snowflake_networking.sql` — update `SET NLB_DNS` at the top
+3. Run as ACCOUNTADMIN
 
-1. **Create PrivateLink endpoint** (Snowsight: Admin > Accounts > PrivateLink > New, or via support)
-2. Edit `setup/02_snowflake_networking.sql` — replace `<NLB_DNS>` with your NLB DNS
-3. Run the SQL as ACCOUNTADMIN:
+### Step 4: Create OpenFlow Runtime — MANUAL (cannot be scripted)
 
-```sql
--- In Snowsight or SnowSQL
-!source setup/02_snowflake_networking.sql
-```
+1. Snowsight > Data Integration > OpenFlow > Create Runtime
+2. Size: Medium (dev) or Large (production, 1500+ tables)
+3. Max Nodes: 3
+4. Attach EAI: select `REDSHIFT_OPENFLOW_EAI`
+5. Copy the runtime name exactly into `OPENFLOW_RUNTIME` in `.env`
 
-### Step 3: Create OpenFlow Runtime (MANUAL)
-
-This step cannot be automated via API.
-
-1. Navigate to **Snowsight > Data Integration > OpenFlow**
-2. Click **Create Runtime**
-3. Name: `redshift` (or your choice)
-4. Size: **Medium** for dev, **Large** for production
-5. Max Nodes: **3** (auto-scales)
-6. **Attach EAI**: Select `REDSHIFT_OPENFLOW_EAI`
-7. Wait for runtime to reach **ACTIVE** status
-
-### Step 4: Snowflake Objects
-
-Creates the database, schemas, target tables, and SCD2 Dynamic Tables.
-
-```sql
--- Edit warehouse name in the Dynamic Table DDL if yours differs from DEMO_JGH
-!source setup/03_snowflake_objects.sql
-```
-
-### Step 5: Seed Redshift
+### Step 5: Snowflake Objects
 
 ```bash
-# Via AWS Data API
-aws redshift-data execute-statement \
-    --workgroup-name openflow-demo-wg \
-    --database demo \
-    --sql "$(cat setup/04_seed_redshift.sql)" \
-    --region us-west-2
+# Run as ACCOUNTADMIN — creates database, schemas, grants
+# Edit SET variables at top of file to match .env
+snowsql -f setup/03_snowflake_objects.sql
 ```
 
-Or connect to Redshift via any SQL client and run `setup/04_seed_redshift.sql`.
+### Step 6: Seed Redshift (optional — skip if data already exists)
 
-### Step 6: Extract JDBC Driver
+```bash
+aws redshift-data execute-statement \
+    --workgroup-name $REDSHIFT_WORKGROUP --database $REDSHIFT_DB \
+    --sql "$(cat setup/04_seed_redshift.sql)" --region $AWS_REGION
+```
+
+### Step 7: Create Target Tables in Snowflake
+
+```bash
+# Queries Redshift metadata, creates matching tables in RAW schema
+# Also enables CHANGE_TRACKING if REPLICATION_MODE=scd2
+python setup/05_create_target_tables.py
+```
+
+### Step 8: Extract JDBC Driver
 
 ```bash
 mkdir -p /tmp/redshift-jdbc
 cd /tmp/redshift-jdbc
-unzip /path/to/drivers/redshift-jdbc42-2.2.5.zip
+unzip /path/to/redshift-openflow-scd2/drivers/redshift-jdbc42-2.2.5.zip
 ```
 
-### Step 7: Build the NiFi Flow
-
-Configure your nipyapi profile for the runtime, then:
+### Step 9: Build the NiFi Flow
 
 ```bash
-export NIFI_PAT="<your-nifi-bearer-token>"
-export NIFI_BASE_URL="https://of--<account>.snowflakecomputing.app/<runtime>/nifi-api"
-export JDBC_JAR_DIR="/tmp/redshift-jdbc"
-export REDSHIFT_PASSWORD="OpenFlowDemo2026"
-
 python connector/build_flow.py
 ```
 
-The script creates the entire pipeline: parameter context, JDBC driver upload, controllers, 6 processors, and all connections.
-
-### Step 8: Validate
+### Step 10: Create SCD2 Dynamic Tables (scd2 mode only — run AFTER first data load)
 
 ```bash
-# Full parity test: Redshift == Snowflake (15 tests)
-SNOWFLAKE_CONNECTION_NAME=<your-connection> python tests/parity_test.py
-
-# SCD2 mutation tests (13 tests)
-SNOWFLAKE_CONNECTION_NAME=<your-connection> python tests/scd2_test_suite.py
+python setup/06_create_scd2_tables.py
 ```
 
-## What Each File Does
+### Step 11: Validate
+
+```bash
+# Row count parity across all tables + SCD2 integrity
+SNOWFLAKE_CONNECTION_NAME=your-connection python tests/parity_test.py
+
+# SCD2 mutation tests (multi-update, soft delete, bulk insert)
+SNOWFLAKE_CONNECTION_NAME=your-connection python tests/scd2_test_suite.py
+```
+
+## File Reference
 
 | File | Purpose |
 |---|---|
+| `.env.example` | All config variables with descriptions |
 | `setup/01_aws_redshift.sh` | AWS: Redshift Serverless + NLB + VPC Endpoint Service |
-| `setup/02_snowflake_networking.sql` | Snowflake: Network Rule, EAI, PrivateLink |
-| `setup/03_snowflake_objects.sql` | Snowflake: Database, schemas, tables, Dynamic Tables (SCD2) |
+| `setup/02_snowflake_networking.sql` | Snowflake: Network Rule + EAI |
+| `setup/03_snowflake_objects.sql` | Snowflake: Database, schemas, grants |
 | `setup/04_seed_redshift.sql` | Redshift: Sample data (customers, orders, products) |
-| `connector/build_flow.py` | NiFi: Complete flow builder (LDT->GTF->ESQL->Convert->Update->PSS) |
-| `tests/parity_test.py` | Validates Redshift == Snowflake data parity (15 tests) |
-| `tests/scd2_test_suite.py` | Tests SCD2 behavior: multi-update, idempotency, soft delete (13 tests) |
-| `drivers/redshift-jdbc42-2.2.5.zip` | Redshift JDBC driver v2.2.5 (56 JARs) |
-| `docs/architecture.drawio` | Architecture diagram (open with draw.io) |
+| `setup/05_create_target_tables.py` | Auto-generates RAW target tables from Redshift metadata |
+| `setup/06_create_scd2_tables.py` | Auto-generates SCD2 Dynamic Tables for all RAW tables |
+| `connector/build_flow.py` | Builds the complete NiFi pipeline (mode-aware) |
+| `tests/parity_test.py` | All-table row count + SCD2 integrity validation |
+| `tests/scd2_test_suite.py` | SCD2 mutation tests (multi-update, soft delete, bulk insert) |
+| `drivers/redshift-jdbc42-2.2.5.zip` | Redshift JDBC driver v2.2.5 |
+| `docs/architecture.drawio` | Architecture diagram |
 
 ## Manual Steps (Cannot Be Scripted)
 
 | Step | Why |
 |---|---|
-| Create OpenFlow runtime | No API, must use Control Plane UI |
-| Attach EAI to runtime | No API, must use Control Plane UI |
+| Create OpenFlow runtime | No Control Plane API — must use UI |
+| Attach EAI to runtime | No Control Plane API — must use UI |
 | Create PrivateLink endpoint | Requires Snowflake admin action |
+
+## Scaling to 1500+ Tables
+
+The NiFi flow uses a dynamic discovery pattern (ListDatabaseTables → GenerateTableFetch)
+that handles any number of tables with **6 fixed processors** — no per-table configuration.
+
+Key settings for large deployments:
+
+```
+DBCP_MAX_CONNECTIONS=25        # Pool connections (>= ESQL_CONCURRENT_TASKS)
+ESQL_CONCURRENT_TASKS=10       # Parallel Redshift reads
+PSS_CONCURRENT_TASKS=5         # Parallel Snowflake writes
+NIFI_QUEUE_OBJECT_THRESHOLD=50000  # Back-pressure threshold (increase for 1500 tables)
+SCD2_CREATE_BATCH_SIZE=50      # DT creation batch size (avoids warehouse saturation)
+```
+
+For SCD2 at 1500 tables, `06_create_scd2_tables.py` creates tables in batches
+of `SCD2_CREATE_BATCH_SIZE` (default 50) to prevent simultaneous ON_CREATE refreshes
+from overwhelming the warehouse.
 
 ## Key Lessons Learned
 
-- **GTF Table Name must be schema-qualified**: `${db.table.schema}.${db.table.name}` because ListDatabaseTables emits table name without schema prefix
-- **nipyapi `create_parameter_context()` returns 500** on some runtimes — use raw NiFi REST API instead
-- **PutSnowpipeStreaming target tables must exist** before data flows — pre-create with grants
-- **UpdateRecord literal-value strategy** cannot reference other fields via `${field.value}` — use QueryRecord SQL for cross-field transforms
-- **NiFi ProcessorsApi `clear_state`** is version-suffixed as `clear_state3()` in nipyapi
-- **Redshift password special characters** (`!`, `@`) can cause issues — use alphanumeric passwords
-
-## Scaling to 1200+ Tables
-
-The flow uses ListDatabaseTables + GenerateTableFetch, which handles any number of tables with a fixed set of 6 processors. To scale:
-
-1. **Runtime**: Upgrade to Large (8 vCPU, 20 GB), max 3-5 nodes
-2. **DBCP Pool**: Already set to 25 connections
-3. **ExecuteSQL**: Already set to 10 concurrent tasks
-4. **Target tables**: Must be pre-created in Snowflake for each source table
-5. **Back pressure**: Increase queue thresholds if needed (default 10,000 FlowFiles)
+- **GTF Table Name must be schema-qualified**: `${db.table.schema}.${db.table.name}` —
+  ListDatabaseTables emits the table name without schema prefix, causing 0 rows silently if wrong
+- **nipyapi `create_parameter_context()` returns HTTP 500** on some runtimes — `build_flow.py`
+  uses raw NiFi REST API for parameter context creation
+- **PutSnowpipeStreaming target tables must exist** before data flows — run
+  `setup/05_create_target_tables.py` first
+- **Redshift passwords with special characters** (!, @) cause JDBC auth failures — use alphanumeric
+- **NiFi ProcessorsApi.clear_state** is version-suffixed as `clear_state3()` in nipyapi
+- **UpdateRecord literal-value strategy** cannot reference other fields — use QueryRecord SQL
+  for cross-field computed columns

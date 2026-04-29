@@ -1,9 +1,24 @@
 import json, subprocess, time, os
+from pathlib import Path
 
-ENV = {**os.environ, "AWS_PROFILE": "484577546576_Contributor"}
-REGION = "us-west-2"
-WG = "openflow-demo-wg"
-DB = "demo"
+_env_file = Path(__file__).resolve().parent.parent / ".env"
+if _env_file.exists():
+    for _line in _env_file.read_text().splitlines():
+        _line = _line.strip()
+        if _line and not _line.startswith("#") and "=" in _line:
+            _k, _, _v = _line.partition("=")
+            os.environ.setdefault(_k.strip(), _v.strip())
+
+ENV = {**os.environ, "AWS_PROFILE": os.getenv("AWS_PROFILE", "default")}
+REGION = os.getenv("AWS_REGION", "us-west-2")
+WG = os.getenv("REDSHIFT_WORKGROUP", "openflow-demo-wg")
+DB = os.getenv("REDSHIFT_DB", "demo")
+REDSHIFT_SCHEMA = os.getenv("REDSHIFT_SCHEMA", "sales")
+
+SF_DATABASE  = os.getenv("SF_DATABASE", "REDSHIFT_DEMO")
+SF_SCHEMA_RAW = os.getenv("SF_SCHEMA_RAW", "RAW")
+SF_SCHEMA_DIM = os.getenv("SF_SCHEMA_DIM", "DIM")
+MODE = os.getenv("REPLICATION_MODE", "scd2")
 
 PASS = 0
 FAIL = 0
@@ -67,7 +82,7 @@ def rs_query(sql):
 
 def sf_query(sql):
     import snowflake.connector
-    conn = snowflake.connector.connect(connection_name=os.getenv("SNOWFLAKE_CONNECTION_NAME") or "JGH-DEMO")
+    conn = snowflake.connector.connect(connection_name=os.getenv("SNOWFLAKE_CONNECTION_NAME") or "")
     cur = conn.cursor()
     cur.execute("USE ROLE ACCOUNTADMIN")
     cur.execute(sql)
@@ -76,6 +91,40 @@ def sf_query(sql):
     cur.close()
     conn.close()
     return cols, rows
+
+
+section(f"GROUP 0: All-Table Row Count Parity  [mode={MODE}]")
+
+log(f"Discovering all tables in Redshift {REDSHIFT_SCHEMA}.*...")
+all_tables_rs = rs_query(
+    f"SELECT DISTINCT table_name FROM information_schema.tables "
+    f"WHERE table_schema = '{REDSHIFT_SCHEMA}' AND table_type = 'BASE TABLE' "
+    f"ORDER BY table_name"
+)
+all_table_names = [r[0] for r in all_tables_rs]
+log(f"Found {len(all_table_names)} source tables: {all_table_names[:10]}{'...' if len(all_table_names) > 10 else ''}")
+
+for tbl in all_table_names:
+    rs_count_rows = rs_query(f"SELECT COUNT(*) FROM {REDSHIFT_SCHEMA}.{tbl}")
+    rs_count = rs_count_rows[0][0] if rs_count_rows else 0
+    try:
+        _, sf_rows = sf_query(f"SELECT COUNT(*) FROM {SF_DATABASE}.{SF_SCHEMA_RAW}.{tbl.upper()}")
+        sf_count = sf_rows[0][0] if sf_rows else 0
+    except Exception as e:
+        record(f"0.{tbl}: Snowflake table exists", False, str(e)[:80])
+        continue
+
+    if MODE == "gold_mirror":
+        # Full refresh: counts should match exactly
+        record(f"0.{tbl}: row counts match exactly", rs_count == sf_count,
+               f"RS={rs_count} SF={sf_count}")
+    else:
+        # CDC/SCD2: Snowflake may have more rows (multiple versions / duplicates from watermark)
+        # Minimum check: Snowflake has at least as many distinct rows as source
+        record(f"0.{tbl}: Snowflake has >= Redshift rows", sf_count >= rs_count,
+               f"RS={rs_count} SF={sf_count}")
+
+log(f"All-table row count check complete")
 
 
 section("GROUP 1: Redshift vs Snowflake CURRENT Row Parity")
@@ -104,7 +153,7 @@ log("Querying Snowflake CUSTOMERS_CURRENT...")
 _, sf_rows = sf_query("""
     SELECT "customer_id", "company_name", "industry", 
            "ANNUAL_REVENUE", "employee_count", "region"
-    FROM REDSHIFT_DEMO.DIM.CUSTOMERS_CURRENT
+    FROM {SF_DATABASE}.DIM.CUSTOMERS_CURRENT
     ORDER BY "customer_id"
 """)
 sf_dict = {}
@@ -173,7 +222,7 @@ _, scd2_rows = sf_query("""
     SELECT "customer_id", "company_name", "industry", "ANNUAL_REVENUE",
            "employee_count", "region", "IS_DELETED",
            "EFFECTIVE_FROM", "EFFECTIVE_TO", "IS_CURRENT", "VERSION"
-    FROM REDSHIFT_DEMO.DIM.CUSTOMERS_SCD2
+    FROM {SF_DATABASE}.DIM.CUSTOMERS_SCD2
     ORDER BY "customer_id", "VERSION"
 """)
 log(f"SCD2 total rows: {len(scd2_rows)}")
@@ -264,7 +313,7 @@ _, enr_rows = sf_query("""
     SELECT CUSTOMER_ID, COMPANY_NAME, COMPANY_NAME_UPPER, INDUSTRY,
            ANNUAL_REVENUE, EMPLOYEE_COUNT, REGION, REGION_CODE,
            REVENUE_TIER, REVENUE_PER_EMPLOYEE, SOURCE_SYSTEM, INGESTED_AT
-    FROM REDSHIFT_DEMO.RAW.CUSTOMERS_ENRICHED
+    FROM {SF_DATABASE}.RAW.CUSTOMERS_ENRICHED
 """)
 log(f"Enriched rows: {len(enr_rows)}")
 

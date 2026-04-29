@@ -1,15 +1,35 @@
 import json, subprocess, time, os, ssl, urllib.request, re
+from pathlib import Path
 
-ENV = {**os.environ, "AWS_PROFILE": "484577546576_Contributor"}
-REGION = "us-west-2"
-WG = "openflow-demo-wg"
-DB = "demo"
+_env_file = Path(__file__).resolve().parent.parent / ".env"
+if _env_file.exists():
+    for _line in _env_file.read_text().splitlines():
+        _line = _line.strip()
+        if _line and not _line.startswith("#") and "=" in _line:
+            _k, _, _v = _line.partition("=")
+            os.environ.setdefault(_k.strip(), _v.strip())
+
+ENV = {**os.environ, "AWS_PROFILE": os.getenv("AWS_PROFILE", "default")}
+REGION = os.getenv("AWS_REGION", "us-west-2")
+WG = os.getenv("REDSHIFT_WORKGROUP", "openflow-demo-wg")
+DB = os.getenv("REDSHIFT_DB", "demo")
+
+SF_DATABASE = os.getenv("SF_DATABASE", "REDSHIFT_DEMO")
+SF_SCHEMA_RAW = os.getenv("SF_SCHEMA_RAW", "RAW")
+SF_SCHEMA_DIM = os.getenv("SF_SCHEMA_DIM", "DIM")
 
 profiles = open(os.path.expanduser('~/.nipyapi/profiles.yml')).read()
-m = re.search(r'jholt_admin_redshift:\s*\n\s*nifi_url:\s*"([^"]+)"\s*\n\s*nifi_bearer_token:\s*"([^"]+)"', profiles)
-NIFI_BASE = m.group(1)
-NIFI_PAT = m.group(2)
-PG_ID = "d43de7fe-019d-1000-ffff-ffffdfbc7459"
+_profile_name = os.getenv("NIPYAPI_PROFILE", "")
+_nifi_url_env = os.getenv("NIFI_BASE_URL", "")
+_nifi_pat_env = os.getenv("NIFI_PAT", "")
+if _profile_name and not _nifi_pat_env:
+    m = re.search(rf'{re.escape(_profile_name)}:\s*\n\s*nifi_url:\s*"([^"]+)"\s*\n\s*nifi_bearer_token:\s*"([^"]+)"', profiles)
+    NIFI_BASE = m.group(1) if m else _nifi_url_env
+    NIFI_PAT = m.group(2) if m else ""
+else:
+    NIFI_BASE = _nifi_url_env
+    NIFI_PAT = _nifi_pat_env
+PG_ID = os.getenv("NIFI_PROCESS_GROUP_ID", "")
 
 SSL_CTX = ssl.create_default_context()
 SSL_CTX.check_hostname = False
@@ -76,7 +96,7 @@ def rs_query(sql):
 
 def sf_query(sql):
     import snowflake.connector
-    conn = snowflake.connector.connect(connection_name=os.getenv("SNOWFLAKE_CONNECTION_NAME") or "JGH-DEMO")
+    conn = snowflake.connector.connect(connection_name=os.getenv("SNOWFLAKE_CONNECTION_NAME") or "")
     cur = conn.cursor()
     cur.execute("USE ROLE ACCOUNTADMIN")
     cur.execute(sql)
@@ -101,11 +121,11 @@ def refresh_dynamic_tables():
     log("Manually refreshing Dynamic Tables...")
     try:
         import snowflake.connector
-        conn = snowflake.connector.connect(connection_name="JGH-DEMO")
+        conn = snowflake.connector.connect(connection_name=os.getenv("SNOWFLAKE_CONNECTION_NAME") or "")
         cur = conn.cursor()
         cur.execute("USE ROLE ACCOUNTADMIN")
-        cur.execute("ALTER DYNAMIC TABLE REDSHIFT_DEMO.DIM.CUSTOMERS_SCD2 REFRESH")
-        cur.execute("ALTER DYNAMIC TABLE REDSHIFT_DEMO.DIM.CUSTOMERS_CURRENT REFRESH")
+        cur.execute("ALTER DYNAMIC TABLE {SF_DATABASE}.DIM.CUSTOMERS_SCD2 REFRESH")
+        cur.execute("ALTER DYNAMIC TABLE {SF_DATABASE}.DIM.CUSTOMERS_CURRENT REFRESH")
         cur.close()
         conn.close()
         time.sleep(10)
@@ -118,7 +138,7 @@ def get_scd2_for_customer(cid):
     _, rows = sf_query(f"""
         SELECT "customer_id", "company_name", "industry", ANNUAL_REVENUE,
                "employee_count", "region", IS_CURRENT, VERSION
-        FROM REDSHIFT_DEMO.DIM.CUSTOMERS_SCD2
+        FROM {SF_DATABASE}.DIM.CUSTOMERS_SCD2
         WHERE "customer_id" = {cid}
         ORDER BY VERSION
     """)
@@ -129,12 +149,12 @@ def get_scd2_counts():
         SELECT COUNT(*) as total,
                SUM(CASE WHEN IS_CURRENT THEN 1 ELSE 0 END) as current_cnt,
                SUM(CASE WHEN NOT IS_CURRENT THEN 1 ELSE 0 END) as hist_cnt
-        FROM REDSHIFT_DEMO.DIM.CUSTOMERS_SCD2
+        FROM {SF_DATABASE}.DIM.CUSTOMERS_SCD2
     """)
     return rows[0]
 
 def get_current_count():
-    _, rows = sf_query("SELECT COUNT(*) FROM REDSHIFT_DEMO.DIM.CUSTOMERS_CURRENT")
+    _, rows = sf_query("SELECT COUNT(*) FROM {SF_DATABASE}.DIM.CUSTOMERS_CURRENT")
     return rows[0][0]
 
 
@@ -151,7 +171,7 @@ rs_exec("UPDATE sales.customers SET industry = 'AI & Technology', annual_revenue
 
 log("Inserting updated row into Snowflake landing table to simulate sync...")
 sf_query("""
-    INSERT INTO REDSHIFT_DEMO.SALES.CUSTOMERS
+    INSERT INTO {SF_DATABASE}.SALES.CUSTOMERS
     ("customer_id","company_name","industry","annual_revenue","employee_count","region","created_at","updated_at")
     VALUES (2,'GlobalTech Inc','AI & Technology','13000000.00',800,'East','1777321550000','1777590000000')
 """)
@@ -161,7 +181,7 @@ log("Applying update #2: GlobalTech Inc revenue -> 14,500,000")
 rs_exec("UPDATE sales.customers SET annual_revenue = 14500000.00, updated_at = GETDATE() WHERE customer_id = 2")
 
 sf_query("""
-    INSERT INTO REDSHIFT_DEMO.SALES.CUSTOMERS
+    INSERT INTO {SF_DATABASE}.SALES.CUSTOMERS
     ("customer_id","company_name","industry","annual_revenue","employee_count","region","created_at","updated_at")
     VALUES (2,'GlobalTech Inc','AI & Technology','14500000.00',800,'East','1777321550000','1777595000000')
 """)
@@ -191,7 +211,7 @@ log(f"Before: SCD2={before_scd2[0]} rows, CURRENT={before_current} rows")
 
 log("Inserting duplicate of existing row (same data, same timestamp)...")
 sf_query("""
-    INSERT INTO REDSHIFT_DEMO.SALES.CUSTOMERS
+    INSERT INTO {SF_DATABASE}.SALES.CUSTOMERS
     ("customer_id","company_name","industry","annual_revenue","employee_count","region","created_at","updated_at")
     VALUES (1,'Acme Corp','Technology','5000000.00',250,'West','1777321550000','1777321550000')
 """)
@@ -219,9 +239,9 @@ log("Soft-deleting customer 8 (EduLearn Platform) in Redshift...")
 rs_exec("UPDATE sales.customers SET is_deleted = TRUE, updated_at = GETDATE() WHERE customer_id = 8")
 
 log("Simulating sync of soft-deleted row to Snowflake...")
-sf_query("ALTER TABLE REDSHIFT_DEMO.SALES.CUSTOMERS ADD COLUMN IF NOT EXISTS \"is_deleted\" VARCHAR")
+sf_query("ALTER TABLE {SF_DATABASE}.SALES.CUSTOMERS ADD COLUMN IF NOT EXISTS \"is_deleted\" VARCHAR")
 sf_query("""
-    INSERT INTO REDSHIFT_DEMO.SALES.CUSTOMERS
+    INSERT INTO {SF_DATABASE}.SALES.CUSTOMERS
     ("customer_id","company_name","industry","annual_revenue","employee_count","region","created_at","updated_at","is_deleted")
     VALUES (8,'EduLearn Platform','Education','2000000.00',80,'East','1777321550000','1777600000000','true')
 """)
@@ -251,7 +271,7 @@ rs_exec("INSERT INTO sales.customers (customer_id,company_name,industry,annual_r
 log("Simulating sync to Snowflake landing table...")
 ts_now = str(int(time.time() * 1000))
 sf_query(f"""
-    INSERT INTO REDSHIFT_DEMO.SALES.CUSTOMERS
+    INSERT INTO {SF_DATABASE}.SALES.CUSTOMERS
     ("customer_id","company_name","industry","annual_revenue","employee_count","region","created_at","updated_at")
     VALUES
     (10,'BioGen Labs','Biotech','6000000.00',200,'East','{ts_now}','{ts_now}'),
@@ -277,7 +297,7 @@ section("TEST 5: Final Reconciliation")
 rs_customers = rs_query("SELECT customer_id, company_name, industry, annual_revenue FROM sales.customers WHERE is_deleted = FALSE ORDER BY customer_id")
 _, sf_customers = sf_query("""
     SELECT "customer_id", "company_name", "industry", ANNUAL_REVENUE
-    FROM REDSHIFT_DEMO.DIM.CUSTOMERS_CURRENT
+    FROM {SF_DATABASE}.DIM.CUSTOMERS_CURRENT
     ORDER BY "customer_id"
 """)
 
